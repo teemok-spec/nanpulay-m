@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ナンプレ自動回答観察アプリ</title>
+<style>
+  html,body{margin:0;background:#0e1420;}
+  #sv-boot-error{display:none;color:#f1ead9;background:#0e1420;font-family:"Hiragino Kaku Gothic ProN","Hiragino Sans",-apple-system,BlinkMacSystemFont,sans-serif;padding:24px;line-height:1.8;font-size:14px;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="sv-boot-error">
+  アプリの読み込みに失敗しました。インターネットに接続した状態で、このページを再読み込みしてください。<br>
+  （React / Babel の読み込み用CDNにアクセスできない環境では動作しません）
+</div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
+
+<script type="text/plain" id="sv-app-source">
+const { useState, useEffect, useRef, useCallback } = React;
+/* ============================================================================
+   M1｜コア：データモデル／ビット表現モジュール
+   責務：盤面状態をビットマスクで表現し、他モジュールが共有する純粋関数を提供する。
+   ※ v2K仕様書の対象外（ソルバーアルゴリズムは無変更）。v02aと同一。
+============================================================================ */
+
+const ALL = 0b111111111;
+const bitcount = (x) => { let c = 0; while (x) { c += x & 1; x >>= 1; } return c; };
+const lowbitIndex = (x) => { let i = 0; while (!(x & 1)) { x >>= 1; i++; } return i; };
+const rc = (pos) => `(${Math.floor(pos / 9) + 1},${(pos % 9) + 1})`;
+
+function buildUnits() {
+  const units = [];
+  for (let r = 0; r < 9; r++) units.push(Array.from({ length: 9 }, (_, c) => r * 9 + c));
+  for (let c = 0; c < 9; c++) units.push(Array.from({ length: 9 }, (_, r) => r * 9 + c));
+  for (let br = 0; br < 3; br++) for (let bc = 0; bc < 3; bc++) {
+    const u = [];
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) u.push((br * 3 + r) * 9 + (bc * 3 + c));
+    units.push(u);
+  }
+  return units;
+}
+const UNITS = buildUnits();
+const ROW_UNITS = UNITS.slice(0, 9); // 6.5 行優先初期処理で使用
+
+function buildPeers() {
+  const peers = [];
+  for (let pos = 0; pos < 81; pos++) {
+    const s = new Set();
+    for (const u of UNITS) if (u.includes(pos)) for (const p of u) if (p !== pos) s.add(p);
+    peers.push([...s]);
+  }
+  return peers;
+}
+const PEERS = buildPeers();
+const peersOf = (pos) => PEERS[pos];
+
+function parsePuzzle(s) {
+  const clean = s.replace(/[_.]/g, "0");
+  return clean.split("").map((ch) => parseInt(ch, 10) || 0);
+}
+
+// 検証済み例題（一意解・重複givenなしを事前確認済み）
+const SAMPLES = {
+  かんたん: "796345000081600900300008700058000300003201000002007068000754810007020409010893027",
+  ふつう: "005900120021600803000023009407060350650410008000030000780200000030080090000000200",
+  むずかしい: "000470010700000406003200000000050201600802000070000050008000030030065000961080000",
+};
+
+/* ============================================================================
+   M2｜手筋（制約伝播）モジュール（v02aと同一・無変更）
+============================================================================ */
+
+function eliminate(cells, pos, depth, ctx, technique) {
+  const val = lowbitIndex(cells[pos]) + 1;
+  const bit = 1 << (val - 1);
+  const affected = [];
+  for (const p of peersOf(pos)) {
+    if (cells[p] & bit) {
+      cells[p] &= ~bit;
+      affected.push(p);
+      if (cells[p] === 0) {
+        ctx.snapshot(cells, {
+          kind: "fail", depth, technique,
+          text: `${rc(p)} の候補が0になり矛盾が発生しました（${rc(pos)}=${val} の確定による）。`,
+          failPos: p,
+        });
+        return "fail";
+      }
+    }
+  }
+  if (affected.length) {
+    ctx.snapshot(cells, {
+      kind: "eliminate", depth, technique,
+      text: `${rc(pos)}=${val} が確定したため、周囲 ${affected.length} マスの候補から ${val} を除去しました。`,
+      sourcePos: pos, elimPositions: affected,
+    });
+    return "changed";
+  }
+  return "none";
+}
+
+function nakedSingle(cells, depth, ctx, opts = {}) {
+  const label = opts.techniqueLabel || "裸シングル";
+  let anyChange = false;
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (let pos = 0; pos < 81; pos++) {
+      if (bitcount(cells[pos]) === 1) {
+        const r = eliminate(cells, pos, depth, ctx, label);
+        if (r === "fail") return "fail";
+        if (r === "changed") { anyChange = true; progress = true; }
+      }
+    }
+  }
+  return anyChange ? "changed" : "none";
+}
+
+function hiddenSingle(cells, depth, ctx, opts = {}) {
+  const scope = opts.unitScope || UNITS;
+  const label = opts.techniqueLabel || "隠れシングル";
+  let anyChange = false;
+  for (const unit of scope) {
+    for (let d = 1; d <= 9; d++) {
+      const bit = 1 << (d - 1);
+      let count = 0, foundPos = -1;
+      for (const pos of unit) if (cells[pos] & bit) { count++; foundPos = pos; }
+      if (count === 1 && bitcount(cells[foundPos]) > 1) {
+        cells[foundPos] = bit;
+        ctx.snapshot(cells, {
+          kind: "eliminate", depth, technique: label,
+          text: `${rc(foundPos)} はこのユニット内で ${d} を置ける唯一のマスのため確定しました。`,
+          sourcePos: foundPos,
+        });
+        const r = eliminate(cells, foundPos, depth, ctx, label);
+        if (r === "fail") return "fail";
+        anyChange = true;
+      }
+    }
+  }
+  return anyChange ? "changed" : "none";
+}
+
+function nakedPair(cells, depth, ctx) {
+  let anyChange = false;
+  for (const unit of UNITS) {
+    const twoCandCells = unit.filter((pos) => bitcount(cells[pos]) === 2);
+    for (let i = 0; i < twoCandCells.length; i++) {
+      for (let j = i + 1; j < twoCandCells.length; j++) {
+        const a = twoCandCells[i], b = twoCandCells[j];
+        if (cells[a] === cells[b]) {
+          const mask = cells[a];
+          let changedHere = false;
+          const affected = [];
+          for (const pos of unit) {
+            if (pos === a || pos === b) continue;
+            if (cells[pos] & mask) {
+              cells[pos] &= ~mask;
+              changedHere = true;
+              affected.push(pos);
+              if (cells[pos] === 0) {
+                ctx.snapshot(cells, {
+                  kind: "fail", depth, technique: "ネイキッドペア",
+                  text: `${rc(pos)} の候補が0になり矛盾が発生しました。`, failPos: pos,
+                });
+                return "fail";
+              }
+            }
+          }
+          if (changedHere) {
+            anyChange = true;
+            ctx.snapshot(cells, {
+              kind: "eliminate", depth, technique: "ネイキッドペア",
+              text: `${rc(a)}と${rc(b)}のネイキッドペアにより、同一ユニット内の他マスから候補を除去しました。`,
+              sourcePos: a, elimPositions: affected,
+            });
+          }
+        }
+      }
+    }
+  }
+  return anyChange ? "changed" : "none";
+}
+
+// 6.1｜手筋レジストリ（技法プラガブル化）
+const TECHNIQUES = [
+  { id: "nakedSingle", label: "裸シングル", priority: 1, enabled: true, run: nakedSingle },
+  { id: "hiddenSingle", label: "隠れシングル", priority: 2, enabled: true, run: hiddenSingle },
+  { id: "nakedPair", label: "ネイキッドペア", priority: 3, enabled: true, run: nakedPair },
+];
+
+function propagate(cells, depth, ctx) {
+  let progress = true;
+  while (progress) {
+    progress = false;
+    const active = TECHNIQUES.filter((t) => t.enabled).sort((a, b) => a.priority - b.priority);
+    for (const t of active) {
+      const r = t.run(cells, depth, ctx);
+      if (r === "fail") return false;
+      if (r === "changed") { progress = true; break; }
+    }
+  }
+  return true;
+}
+
+/* ----------------------------------------------------------------------------
+   6.5｜行優先初期処理（v02aと同一・無変更）
+---------------------------------------------------------------------------- */
+function rowFirstPrepass(cells, depth, ctx) {
+  while (true) {
+    let r = nakedSingle(cells, depth, ctx, { techniqueLabel: "行優先初期処理" });
+    if (r === "fail") return false;
+    if (r === "changed") continue;
+    r = hiddenSingle(cells, depth, ctx, { unitScope: ROW_UNITS, techniqueLabel: "行優先初期処理" });
+    if (r === "fail") return false;
+    if (r === "changed") continue;
+    break;
+  }
+  return true;
+}
+
+/* ============================================================================
+   M3｜仮定探索／バックトラッキングモジュール（v02aと同一・無変更）
+============================================================================ */
+
+function selectMRV(cells) {
+  let best = -1, bestCount = 10;
+  for (let pos = 0; pos < 81; pos++) {
+    const c = bitcount(cells[pos]);
+    if (c >= 2 && c < bestCount) { bestCount = c; best = pos; }
+  }
+  return best;
+}
+
+function search(cellsIn, depth, ctx) {
+  const cells = cellsIn.slice();
+
+  if (depth === 0) {
+    if (!rowFirstPrepass(cells, depth, ctx)) {
+      ctx.creditNearestCheckpoint(ctx.steps.length - 1);
+      return false;
+    }
+  }
+
+  if (!propagate(cells, depth, ctx)) {
+    ctx.creditNearestCheckpoint(ctx.steps.length - 1);
+    return false;
+  }
+
+  const allDone = cells.every((c) => bitcount(c) === 1);
+  if (allDone) {
+    ctx.snapshot(cells, { kind: "solved", depth, technique: "完了", text: "すべてのマスが確定し、解が見つかりました。" });
+    return true;
+  }
+
+  const pos = selectMRV(cells);
+  if (pos === -1) {
+    ctx.creditNearestCheckpoint(ctx.steps.length - 1);
+    return false;
+  }
+  const mask = cells[pos];
+  ctx.addCheckpoint(ctx.steps.length, `${rc(pos)} の仮定探索`, "branch");
+
+  for (let d = 1; d <= 9; d++) {
+    if (mask & (1 << (d - 1))) {
+      const branch = cells.slice();
+      branch[pos] = 1 << (d - 1);
+      ctx.snapshot(branch, {
+        kind: "guess", depth: depth + 1, technique: "MRV仮定探索",
+        text: `${rc(pos)} を候補 ${d} と仮定して探索します（候補数最小マス, 全${bitcount(mask)}候補中）。`,
+        guessPos: pos,
+      });
+      if (search(branch, depth + 1, ctx)) return true;
+    }
+  }
+  return false;
+}
+
+/* ============================================================================
+   M4｜チェックポイント管理モジュール（v02aと同一・無変更）
+============================================================================ */
+
+const CP_INTERVAL = 25;
+
+function makeCheckpointManager() {
+  const checkpoints = [];
+  let seq = 0;
+  function addCheckpoint(step, label, type) {
+    const cp = { step, label, type, seq: seq++, hits: 0 };
+    checkpoints.push(cp);
+    return cp;
+  }
+  function creditNearestCheckpoint(failStep) {
+    let nearest = null;
+    for (const cp of checkpoints) if (cp.step <= failStep && (!nearest || cp.step > nearest.step)) nearest = cp;
+    if (nearest) nearest.hits += 1;
+  }
+  return { checkpoints, addCheckpoint, creditNearestCheckpoint };
+}
+
+/* ============================================================================
+   M5｜ソルバー実行制御モジュール（v02aと同一・無変更）
+============================================================================ */
+
+function runSolve(given) {
+  const steps = [];
+  const cpManager = makeCheckpointManager();
+  let passCount = 0;
+
+  const ctx = {
+    steps,
+    checkpoints: cpManager.checkpoints,
+    addCheckpoint: cpManager.addCheckpoint,
+    creditNearestCheckpoint: cpManager.creditNearestCheckpoint,
+    snapshot(cells, info) {
+      passCount++;
+      steps.push({ ...info, pass: passCount, cells: cells.slice() });
+      if (steps.length % CP_INTERVAL === 0) {
+        cpManager.addCheckpoint(steps.length - 1, `${steps.length}手目`, "interval");
+      }
+    },
+  };
+
+  const initCells = given.map((v) => (v === 0 ? ALL : 1 << (v - 1)));
+  steps.push({ kind: "init", depth: 0, technique: "初期化", text: "初期盤面を読み込みました。", pass: 0, cells: initCells.slice() });
+
+  const ok = search(initCells, 0, ctx);
+  const error = ok ? null : "解が見つかりませんでした。この盤面には解が存在しないか、入力に誤りがある可能性があります。";
+
+  return { frames: steps, cps: cpManager.checkpoints, error };
+}
+
+/* ============================================================================
+   M9｜候補表示（作成支援）モジュール
+   責務：編集モード中、空欄マスに置ける数字（重複しない数字）だけをガイド表示する。
+   ロジック（usableDigits／hasConflict）自体はv02aと同一・無変更。
+   表示ルールのみ v2K仕様書 6章に準拠して更新（横並びリスト・閾値・色分け）。
+   ※ 求解アニメーション中の候補表示（M7）は現状維持（3×3・色分けなし）のため対象外。
+============================================================================ */
+
+function usableDigits(given, pos) {
+  if (given[pos] !== 0) return [];
+  const row = Math.floor(pos / 9), col = pos % 9;
+  const used = new Set();
+  for (let c = 0; c < 9; c++) { const v = given[row * 9 + c]; if (v) used.add(v); }
+  for (let r = 0; r < 9; r++) { const v = given[r * 9 + col]; if (v) used.add(v); }
+  const br = 3 * Math.floor(row / 3), bc = 3 * Math.floor(col / 3);
+  for (let r = br; r < br + 3; r++) for (let c = bc; c < bc + 3; c++) { const v = given[r * 9 + c]; if (v) used.add(v); }
+  const out = [];
+  for (let d = 1; d <= 9; d++) if (!used.has(d)) out.push(d);
+  return out;
+}
+
+// 追加機能①：編集中の重複入力検知（同一行・列・3×3ブロック内に同じ数字が既にあるか）
+function hasConflict(given, pos) {
+  const v = given[pos];
+  if (v === 0) return false;
+  const row = Math.floor(pos / 9), col = pos % 9;
+  for (let c = 0; c < 9; c++) { if (c !== col && given[row * 9 + c] === v) return true; }
+  for (let r = 0; r < 9; r++) { if (r !== row && given[r * 9 + col] === v) return true; }
+  const br = 3 * Math.floor(row / 3), bc = 3 * Math.floor(col / 3);
+  for (let r = br; r < br + 3; r++) for (let c = bc; c < bc + 3; c++) { if ((r * 9 + c) !== pos && given[r * 9 + c] === v) return true; }
+  return false;
+}
+
+/* ============================================================================
+   M13｜スタイル／デザイントークンモジュール
+   v2K：スマートフォン縦画面を基準にした単一カラムレイアウトへ再構成。
+   既存のダークテーマ（--bg/--ink/--panel等）は維持し、レイアウトのみ再構成する
+   （仕様書8章）。--cand4 のみ新規追加（仕様書6.2）。
+============================================================================ */
+
+const CSS = `
+:root{
+  --bg:#0e1420; --panel:#161d2c; --panel2:#121927; --ink:#f1ead9; --muted:#8b93a8;
+  --line:#2a3348; --accent:#c9a15c; --guess:#8a5a3d; --elim:#28344c; --solved:#7fa87a;
+  --fail:#b8555a; --cand2:#5b9bd5; --cand3:#d4b23c; --cand4:#9a9a9a;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+html,body{margin:0;background:var(--bg);}
+body{color:var(--ink);font-family:"Zen Kaku Gothic New","Hiragino Kaku Gothic ProN","Hiragino Sans",-apple-system,BlinkMacSystemFont,sans-serif;}
+button{font-family:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent;}
+button:disabled{cursor:not-allowed;opacity:0.45;}
+input{font-family:inherit;}
+::-webkit-scrollbar{width:8px;height:8px;}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px;}
+.sv-edit-input{caret-color:var(--ink);}
+.sv-edit-input::placeholder{color:var(--ph-color,var(--muted));opacity:1;letter-spacing:1px;font-weight:700;}
+@keyframes sv-solve-flash{
+  0%{border-color:var(--ink);}
+  19%{border-color:var(--ink);}
+  20%{border-color:var(--cand3);}
+  39%{border-color:var(--cand3);}
+  40%{border-color:var(--fail);}
+  59%{border-color:var(--fail);}
+  60%{border-color:var(--cand2);}
+  79%{border-color:var(--cand2);}
+  80%{border-color:var(--ink);}
+  100%{border-color:var(--ink);}
+}
+.sv-solve-flash{animation:sv-solve-flash 1250ms linear 1;}
+`;
+
+const S = {
+  // --- 全体レイアウト（縦画面・単一カラム） ---
+  app: { minHeight: "100vh", background: "var(--bg)", color: "var(--ink)", padding: "14px 14px 88px", display: "flex", flexDirection: "column", gap: 12, maxWidth: 480, margin: "0 auto" },
+
+  // --- ヘッダー（簡略・1行） ---
+  header: { display: "flex", alignItems: "baseline" },
+  title: { fontSize: 18.5, fontWeight: 800, margin: 0, letterSpacing: 0.5 },
+
+  errorBox: { background: "rgba(184,85,90,0.14)", border: "1px solid var(--fail)", color: "var(--fail)", borderRadius: 10, padding: "10px 14px", fontSize: 13, fontWeight: 600 },
+
+  // --- 盤面（M7） ---
+  boardWrap: { display: "flex", justifyContent: "center" },
+  board: { width: "min(100%, 440px)", aspectRatio: "1 / 1", display: "grid", gridTemplateColumns: "repeat(9, 1fr)", gridTemplateRows: "repeat(9, 1fr)", background: "var(--panel2)", border: "2px solid var(--ink)", borderRadius: 4, overflow: "hidden" },
+  cell: { display: "flex", alignItems: "center", justifyContent: "center", position: "relative", background: "transparent", minWidth: 0, minHeight: 0 },
+  cellDigit: (given, highlighted) => ({ fontSize: "clamp(15px, 5.2vw, 23px)", fontWeight: given ? 800 : 600, color: highlighted ? "var(--solved)" : "var(--ink)" }),
+  cands: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: "repeat(3, 1fr)", width: "100%", height: "100%", padding: 2 },
+  candDigit: { fontSize: "clamp(7.5px, 2.1vw, 10.5px)", color: "var(--muted)", display: "flex", alignItems: "center", justifyContent: "center" },
+  cellInput: { width: "100%", height: "100%", background: "transparent", border: "none", outline: "none", textAlign: "center", fontSize: "clamp(15px, 5vw, 21px)", fontWeight: 700, color: "var(--ink)" },
+
+  // --- 簡易ステータス（盤面直下） ---
+  statusBar: { fontSize: 12, color: "var(--muted)", display: "flex", justifyContent: "space-between", padding: "0 2px" },
+
+  // --- 常時操作エリア（4段） ---
+  opArea: { display: "flex", flexDirection: "column", gap: 8, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 12, padding: "12px" },
+  opRow3: { display: "flex", gap: 8 },
+  opRow2: { display: "flex", gap: 8 },
+  speedLabel: { fontSize: 11.5, color: "var(--muted)", textAlign: "center", marginBottom: -2 },
+  speedRow: { display: "flex", gap: 8 },
+
+  btn: (variant) => {
+    const base = { flex: 1, padding: "10px 8px", borderRadius: 9, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--ink)", fontSize: 13.5, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, textAlign: "center" };
+    if (variant === "primary") return { ...base, background: "var(--accent)", color: "#20180a", border: "1px solid var(--accent)" };
+    if (variant === "ghost") return { ...base, background: "transparent" };
+    return base;
+  },
+  speedBtn: (active) => ({ flex: 1, padding: "8px 6px", borderRadius: 8, border: `1px solid ${active ? "var(--accent)" : "var(--line)"}`, background: active ? "rgba(201,161,92,0.16)" : "var(--panel2)", color: active ? "var(--accent)" : "var(--muted)", fontSize: 13, fontWeight: 700 }),
+
+  // --- 展開パネル（情報／編集、常時操作エリアの下・最下段バーの上） ---
+  panelArea: { display: "flex", flexDirection: "column", gap: 12, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 12, padding: 14 },
+  stepHead: { fontSize: 12.5, color: "var(--muted)" },
+  badge: (kind) => {
+    const colors = { init: "var(--muted)", eliminate: "var(--elim)", guess: "var(--guess)", fail: "var(--fail)", solved: "var(--solved)" };
+    const c = colors[kind] || "var(--muted)";
+    return { display: "inline-block", padding: "3px 10px", borderRadius: 999, background: "rgba(255,255,255,0.06)", border: `1px solid ${c}`, color: c, fontSize: 12, fontWeight: 800, alignSelf: "flex-start" };
+  },
+  logText: { fontSize: 14, lineHeight: 1.7, color: "var(--ink)" },
+  metaRow: { display: "flex", gap: 14, fontSize: 12, color: "var(--muted)", flexWrap: "wrap" },
+  legend: { display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 },
+  legendRow: { display: "flex", alignItems: "center", gap: 8 },
+  legendSwatch: (color) => ({ width: 14, height: 14, borderRadius: 4, background: color, flexShrink: 0 }),
+
+  cpBox: { display: "flex", flexDirection: "column", gap: 8 },
+  cpHead: { fontSize: 12, color: "var(--muted)", display: "flex", justifyContent: "space-between" },
+  cpList: { display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" },
+  cpItem: (type, reached, isCurrent) => ({
+    display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+    padding: "6px 10px", borderRadius: 7,
+    borderLeft: `3px solid ${type === "branch" ? "var(--accent)" : "#5b9bd5"}`,
+    background: isCurrent ? "rgba(201,161,92,0.14)" : "rgba(255,255,255,0.03)",
+    opacity: reached ? 1 : 0.42, fontSize: 12, cursor: "pointer",
+  }),
+  hitsBadge: { background: "rgba(127,168,122,0.18)", color: "var(--solved)", borderRadius: 999, padding: "1px 8px", fontSize: 11, fontWeight: 800 },
+
+  // --- 編集パネル固有 ---
+  chipsRow: { display: "flex", gap: 6 },
+  chip: (active) => ({ flex: 1, padding: "8px 6px", borderRadius: 999, border: `1px solid ${active ? "var(--accent)" : "var(--line)"}`, background: active ? "rgba(201,161,92,0.16)" : "transparent", color: active ? "var(--accent)" : "var(--muted)", fontSize: 12.5, fontWeight: 700 }),
+  editToolsRow: { display: "flex", gap: 8 },
+
+  // --- 最下段バー：情報／編集トグル（M12） ---
+  bottomNavOuter: { position: "fixed", left: 0, right: 0, bottom: 0, display: "flex", justifyContent: "center", background: "var(--panel)", borderTop: "1px solid var(--line)", zIndex: 20, paddingBottom: "env(safe-area-inset-bottom, 0px)" },
+  bottomNav: { display: "flex", width: "100%", maxWidth: 480 },
+  navBtn: (active) => ({ flex: 1, padding: "12px 6px", background: active ? "rgba(201,161,92,0.12)" : "transparent", border: "none", borderTop: active ? "2px solid var(--accent)" : "2px solid transparent", color: active ? "var(--accent)" : "var(--muted)", fontSize: 13.5, fontWeight: 700 }),
+};
+
+// 3.2｜速度セレクタ：連続スライダーから離散3段階（速／標準／遅）へ変更
+const SPEED_OPTIONS = [
+  { label: "速", ms: 150 },
+  { label: "標準", ms: 500 },
+  { label: "遅", ms: 900 },
+];
+
+/* ============================================================================
+   M7｜盤面表示ヘルパー ／ M10｜情報パネル用ラベル（v02aと同一・無変更）
+============================================================================ */
+
+function cellDisplay(mask) {
+  const count = bitcount(mask);
+  if (count === 0) return { type: "contradiction" };
+  if (count === 1) return { type: "digit", value: lowbitIndex(mask) + 1 };
+  const values = [];
+  for (let d = 1; d <= 9; d++) if (mask & (1 << (d - 1))) values.push(d);
+  return { type: "candidates", values };
+}
+
+function kindLabel(kind) {
+  switch (kind) {
+    case "init": return "初期化";
+    case "eliminate": return "候補排除";
+    case "guess": return "仮定";
+    case "fail": return "矛盾";
+    case "solved": return "完了";
+    default: return kind;
+  }
+}
+
+/* ============================================================================
+   M14｜アプリ状態管理・ルートコンポーネント
+   v2K：情報パネル／編集パネルはボトムナビ（情報／編集）で開閉し、互いに排他。
+   「編集」＝盤面が入力可能になる編集モードそのものであり、パネルの開閉と1対1で連動する
+   （仕様書5章「既存M8・M9の統合窓口」に基づく実装解釈）。
+============================================================================ */
+
+function SudokuVisualizer() {
+  // --- state ---
+  const [sampleKey, setSampleKey] = useState("ふつう");
+  const [given, setGiven] = useState(() => parsePuzzle(SAMPLES["ふつう"]));
+  const [frames, setFrames] = useState([]);
+  const [cps, setCps] = useState([]);
+  const [idx, setIdx] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(500);
+  const [solving, setSolving] = useState(false);
+  const [error, setError] = useState(null);
+  const [editing, setEditing] = useState(false); // = 編集パネル開閉状態と1対1
+  const [infoOpen, setInfoOpen] = useState(false); // = 情報パネル開閉状態
+  const [showCandidates, setShowCandidates] = useState(false);
+  const [autoFilledSet, setAutoFilledSet] = useState(() => new Set());
+  const [solveDone, setSolveDone] = useState(false); // 再生が最後まで進み自動停止した後 true。「求解する」⇔「終了」表示を切替
+  const [flashSeq, setFlashSeq] = useState(0); // 求解完了フラッシュ（白黄赤青白）の再生トリガー用シーケンス番号
+  const timerRef = useRef(null);
+
+  // --- 例題選択（編集パネル内） ---
+  const loadSample = useCallback((k) => {
+    setSampleKey(k);
+    setGiven(parsePuzzle(SAMPLES[k]));
+    setFrames([]); setCps([]); setIdx(0); setPlaying(false); setError(null);
+    setEditing(false); setShowCandidates(false); setAutoFilledSet(new Set());
+  }, []);
+
+  // --- M5: 求解 ---
+  const solve = useCallback(() => {
+    setSolving(true); setError(null); setEditing(false); setPlaying(false); setSolveDone(false);
+    setTimeout(() => {
+      try {
+        const { frames: fs, cps: cs, error: err } = runSolve(given);
+        setFrames(fs); setCps(cs); setIdx(0); setError(err); setSolving(false);
+        if (!err) setPlaying(true);
+      } catch (e) {
+        setError("求解中にエラーが発生しました: " + (e && e.message ? e.message : String(e)));
+        setSolving(false);
+      }
+    }, 20);
+  }, [given]);
+
+  // --- M6: 再生制御 ---
+  // 1手ずつのアニメーションが最後まで進み自動停止した瞬間に、
+  // 「終了」表示への切替（1）と盤面の色変化アニメーション（2）をトリガーする。
+  useEffect(() => {
+    if (!playing) return undefined;
+    if (idx >= frames.length - 1) {
+      setPlaying(false);
+      setSolveDone(true);
+      setFlashSeq((s) => s + 1);
+      return undefined;
+    }
+    timerRef.current = setTimeout(() => setIdx((i) => Math.min(i + 1, frames.length - 1)), speed);
+    return () => clearTimeout(timerRef.current);
+  }, [playing, idx, frames.length, speed]);
+
+  const jumpToCp = useCallback((step) => { setPlaying(false); setIdx(step); }, []);
+  const prevCp = useCallback(() => {
+    const before = cps.filter((c) => c.step < idx).sort((a, b) => b.step - a.step);
+    if (before.length) jumpToCp(before[0].step);
+  }, [cps, idx, jumpToCp]);
+  const nextCp = useCallback(() => {
+    const after = cps.filter((c) => c.step > idx).sort((a, b) => a.step - b.step);
+    if (after.length) jumpToCp(after[0].step);
+  }, [cps, idx, jumpToCp]);
+  const stepPrev = useCallback(() => { setPlaying(false); setIdx((i) => Math.max(0, i - 1)); }, []);
+  const stepNext = useCallback(() => { setPlaying(false); setIdx((i) => Math.min(frames.length - 1, i + 1)); }, [frames.length]);
+
+  // --- M8: 問題編集モード（＝編集パネル） ---
+  const startEdit = useCallback(() => {
+    setEditing(true); setFrames([]); setCps([]); setIdx(0); setError(null); setPlaying(false);
+  }, []);
+  const endEdit = useCallback(() => { setEditing(false); setShowCandidates(false); }, []);
+  const resetChart = useCallback(() => { setGiven(Array(81).fill(0)); setAutoFilledSet(new Set()); }, []);
+  const onEditCell = useCallback((pos, raw) => {
+    const ch = (raw || "").slice(-1);
+    const digit = /^[1-9]$/.test(ch) ? parseInt(ch, 10) : 0;
+    setGiven((prev) => { const next = prev.slice(); next[pos] = digit; return next; });
+    setAutoFilledSet((prev) => { if (!prev.has(pos)) return prev; const s = new Set(prev); s.delete(pos); return s; });
+  }, []);
+
+  // --- 3.3: 情報／編集パネルはボトムナビで排他トグル ---
+  // 1.1／1.2：情報・編集どちらのボタンにアクセスしても「終了」表示は「求解する」へ戻す
+  const handleToggleInfo = useCallback(() => {
+    setSolveDone(false);
+    if (infoOpen) { setInfoOpen(false); return; }
+    if (editing) endEdit();
+    setInfoOpen(true);
+  }, [infoOpen, editing, endEdit]);
+  const handleToggleEdit = useCallback(() => {
+    setSolveDone(false);
+    if (editing) { endEdit(); return; }
+    setInfoOpen(false);
+    startEdit();
+  }, [editing, endEdit, startEdit]);
+
+  // --- 3.9.1: 候補数1マスの連鎖的自動確定（showCandidates ON の間だけ動作） ---
+  useEffect(() => {
+    if (!editing || !showCandidates) return undefined;
+    for (let pos = 0; pos < 81; pos++) {
+      if (given[pos] === 0) {
+        const opts = usableDigits(given, pos);
+        if (opts.length === 1) {
+          const next = given.slice();
+          next[pos] = opts[0];
+          setGiven(next);
+          setAutoFilledSet((prev) => { const s = new Set(prev); s.add(pos); return s; });
+          return undefined;
+        }
+      }
+    }
+    return undefined;
+  }, [given, editing, showCandidates]);
+
+  // --- 派生値 ---
+  const cur = frames.length ? frames[idx] : null;
+  const curCells = cur ? cur.cells : given.map((v) => (v === 0 ? ALL : 1 << (v - 1)));
+  const confirmedCount = curCells.filter((c) => bitcount(c) === 1).length;
+  const blockLineHighlight = editing && showCandidates;
+
+  return (
+    <div style={S.app}>
+      <style>{CSS}</style>
+
+      {/* ヘッダー（簡略・1行） */}
+      <div style={S.header}>
+        <h1 style={S.title}>ナンプレ自動回答観察アプリ</h1>
+      </div>
+
+      {/* エラー表示（発生時のみ・ヘッダー直下／盤面の上に常時表示） */}
+      {error && <div style={S.errorBox}>{error}</div>}
+
+      {/* M7: 盤面 */}
+      <div style={S.boardWrap}>
+        <div key={flashSeq} className={flashSeq > 0 ? "sv-solve-flash" : undefined} style={S.board}>
+          {Array.from({ length: 81 }, (_, pos) => {
+            const row = Math.floor(pos / 9), col = pos % 9;
+            const rightThick = col % 3 === 2 && col !== 8;
+            const bottomThick = row % 3 === 2 && row !== 8;
+            const lineColor = blockLineHighlight ? "var(--ink)" : "var(--line)";
+            const borderStyle = {
+              borderRight: rightThick ? `2px solid ${lineColor}` : "1px solid var(--line)",
+              borderBottom: bottomThick ? `2px solid ${lineColor}` : "1px solid var(--line)",
+            };
+
+            if (editing) {
+              const v = given[pos];
+              const isAuto = autoFilledSet.has(pos);
+              const conflict = hasConflict(given, pos);
+
+              // M9候補ガイド（6章）：横並びリストのみ。残り5以上は非表示／4=灰／3=黄／2=青／1=自動確定（非表示）／0=×
+              let placeholder = "", phColor = "var(--muted)";
+              if (v === 0 && showCandidates) {
+                const opts = usableDigits(given, pos);
+                const n = opts.length;
+                if (n === 0) { placeholder = "×"; phColor = "var(--fail)"; }
+                else if (n === 2) { placeholder = opts.join(""); phColor = "var(--cand2)"; }
+                else if (n === 3) { placeholder = opts.join(""); phColor = "var(--cand3)"; }
+                else if (n === 4) { placeholder = opts.join(""); phColor = "var(--cand4)"; }
+                // n === 1 は自動確定に委ねるため非表示、n >= 5 は視認性優先のため非表示
+              }
+
+              const inputColor = conflict ? "var(--fail)" : isAuto ? "var(--solved)" : "var(--ink)";
+              return (
+                <div key={pos} style={{ ...S.cell, ...borderStyle }}>
+                  <input
+                    className="sv-edit-input"
+                    style={{ ...S.cellInput, "--ph-color": phColor, fontStyle: isAuto ? "italic" : "normal", color: inputColor }}
+                    value={v === 0 ? "" : String(v)}
+                    placeholder={placeholder}
+                    inputMode="numeric"
+                    title={conflict ? "同じ行・列・ブロック内に重複する数字があります" : isAuto ? "候補が1つに絞られたため自動確定されました" : undefined}
+                    onChange={(e) => onEditCell(pos, e.target.value)}
+                  />
+                </div>
+              );
+            }
+
+            // M7（求解アニメーション中の表示）：v02aと同一・無変更（3×3グリッド、色分けなし）
+            const mask = curCells[pos];
+            const disp = cellDisplay(mask);
+            const isGivenCell = given[pos] !== 0;
+            const isGuess = cur && cur.kind === "guess" && cur.guessPos === pos;
+            const isSource = cur && cur.kind === "eliminate" && cur.sourcePos === pos;
+            const isElimTarget = cur && cur.kind === "eliminate" && cur.elimPositions && cur.elimPositions.includes(pos);
+            const isFailPos = cur && cur.kind === "fail" && cur.failPos === pos;
+
+            let bg = "transparent";
+            if (isGuess) bg = "var(--guess)";
+            else if (isFailPos) bg = "var(--fail)";
+            else if (isElimTarget) bg = "var(--elim)";
+
+            return (
+              <div key={pos} style={{ ...S.cell, ...borderStyle, background: bg }}>
+                {disp.type === "digit" && (
+                  <span style={S.cellDigit(isGivenCell, isSource)}>{disp.value}</span>
+                )}
+                {disp.type === "contradiction" && <span style={{ color: "var(--fail)", fontSize: "clamp(13px,4.5vw,19px)", fontWeight: 800 }}>×</span>}
+                {disp.type === "candidates" && (
+                  <div style={S.cands}>
+                    {Array.from({ length: 9 }, (_, i) => i + 1).map((d) => (
+                      <span key={d} style={{ ...S.candDigit, visibility: disp.values.includes(d) ? "visible" : "hidden" }}>{d}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 簡易ステータス（盤面直下） */}
+      <div style={S.statusBar}>
+        <span>{editing ? "編集モード" : cur ? `技法: ${cur.technique}` : "求解前"}</span>
+        <span>{frames.length ? `${idx + 1} / ${frames.length}` : "－ / －"}</span>
+      </div>
+
+      {/* 常時操作エリア（4段構成） */}
+      <div style={S.opArea}>
+        {/* 1段目：求解する */}
+        <button style={S.btn("primary")} onClick={solve} disabled={solving || editing}>
+          {solving ? "求解中…" : solveDone ? "終了" : "求解する"}
+        </button>
+
+        {/* 2段目：◀1手／再生・一時停止／1手▶ */}
+        <div style={S.opRow3}>
+          <button style={S.btn("ghost")} onClick={stepPrev} disabled={!frames.length || idx === 0}>◀ 1手</button>
+          <button style={S.btn()} onClick={() => setPlaying((p) => !p)} disabled={!frames.length || (idx >= frames.length - 1 && !playing)}>
+            {playing ? "一時停止" : "再生"}
+          </button>
+          <button style={S.btn("ghost")} onClick={stepNext} disabled={!frames.length || idx >= frames.length - 1}>1手 ▶</button>
+        </div>
+
+        {/* 3段目：◀折返／折返▶ */}
+        <div style={S.opRow2}>
+          <button style={S.btn("ghost")} onClick={prevCp} disabled={!cps.length}>◀ 折返</button>
+          <button style={S.btn("ghost")} onClick={nextCp} disabled={!cps.length}>折返 ▶</button>
+        </div>
+
+        {/* 4段目：速度セレクタ（速／標準／遅の3段階） */}
+        <div>
+          <div style={S.speedLabel}>速度</div>
+          <div style={S.speedRow}>
+            {SPEED_OPTIONS.map((opt) => (
+              <button key={opt.ms} style={S.speedBtn(speed === opt.ms)} onClick={() => setSpeed(opt.ms)}>{opt.label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* 展開パネル：情報（分類c） */}
+      {infoOpen && (
+        <div style={S.panelArea}>
+          {cur ? (
+            <>
+              <div style={S.stepHead}>ステップ {idx + 1} / {frames.length}</div>
+              <span style={S.badge(cur.kind)}>{kindLabel(cur.kind)}</span>
+              <div style={S.logText}>{cur.text}</div>
+              <div style={S.metaRow}>
+                <span>巡回: {cur.pass}</span>
+                <span>探索の深さ: {cur.depth}</span>
+                <span>確定マス: {confirmedCount} / 81</span>
+              </div>
+            </>
+          ) : (
+            <div style={S.logText}>「求解する」を押すと、制約伝播とバックトラッキングの過程が1手ずつ再生されます。</div>
+          )}
+
+          <div style={S.legend}>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--guess)")} />仮定したマス</div>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--elim)")} />候補を排除中</div>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--solved)")} />解で埋めた数字</div>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--fail)")} />矛盾（候補が0に）</div>
+          </div>
+
+          {!!cps.length && (
+            <div style={S.cpBox}>
+              <div style={S.cpHead}>
+                <span>折り返しポイント: {cps.length}件</span>
+                <span>有効回数合計: {cps.reduce((a, c) => a + c.hits, 0)}</span>
+              </div>
+              <div style={S.cpList}>
+                {cps.map((cp) => (
+                  <div key={cp.seq} style={S.cpItem(cp.type, cp.step <= idx, cp.step === idx)} onClick={() => jumpToCp(cp.step)}>
+                    <span>#{cp.seq + 1} ・ {cp.step + 1}手目 ・ {cp.label}</span>
+                    {cp.hits > 0 && <span style={S.hitsBadge}>×{cp.hits}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 展開パネル：編集（分類b、既存M8・M9の統合窓口） */}
+      {editing && (
+        <div style={S.panelArea}>
+          <div style={S.stepHead}>例題から選ぶ</div>
+          <div style={S.chipsRow}>
+            {Object.keys(SAMPLES).map((k) => (
+              <button key={k} style={S.chip(sampleKey === k)} onClick={() => loadSample(k)}>{k}</button>
+            ))}
+          </div>
+
+          <div style={S.logText}>
+            マスをタップして数字（1〜9）を直接入力してください。0 または範囲外の入力は空欄として扱われます。
+            同じ行・列・3×3ブロック内に数字が重複した場合、その数字は赤字で表示されます。
+            {showCandidates && ` 候補表示がONの間は、残り候補数が4以下のマスにのみ候補を表示します（4=灰・3=黄・2=青）。候補が1つに絞られたマスへは自動で数字が入力されます（斜体表示のマスが自動確定分です）。`}
+          </div>
+
+          <div style={S.editToolsRow}>
+            <button style={S.btn(showCandidates ? "primary" : undefined)} onClick={() => setShowCandidates((s) => !s)}>
+              候補表示{showCandidates ? " ON" : " OFF"}
+            </button>
+            <button style={S.btn("ghost")} onClick={resetChart}>チャートの初期化</button>
+          </div>
+
+          <button style={S.btn("primary")} onClick={endEdit}>編集終了</button>
+        </div>
+      )}
+
+      {/* 最下段バー：情報／編集トグル（M12新設） */}
+      <div style={S.bottomNavOuter}>
+        <div style={S.bottomNav}>
+          <button style={S.navBtn(infoOpen)} onClick={handleToggleInfo}>情報</button>
+          <button style={S.navBtn(editing)} onClick={handleToggleEdit}>編集</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(SudokuVisualizer));
+</script>
+
+<script>
+(function () {
+  function showBootError() {
+    var root = document.getElementById("root");
+    var err = document.getElementById("sv-boot-error");
+    if (root) root.style.display = "none";
+    if (err) err.style.display = "block";
+  }
+  try {
+    if (!window.React || !window.ReactDOM || !window.Babel) {
+      showBootError();
+      return;
+    }
+    var source = document.getElementById("sv-app-source").textContent;
+    var transformed = Babel.transform(source, {
+      presets: [["react", { runtime: "classic" }]],
+      filename: "sudoku_solver_v2k.jsx"
+    }).code;
+    var script = document.createElement("script");
+    script.text = transformed;
+    document.body.appendChild(script);
+  } catch (e) {
+    console.error(e);
+    showBootError();
+  }
+})();
+</script>
+</body>
+</html>
