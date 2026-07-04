@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ナンプレ自動回答観察アプリ v02</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/plain" id="app-source">
+const { useState, useEffect, useRef, useCallback } = React;
+
+
+/* ============================================================================
+   M1｜コア：データモデル／ビット表現モジュール
+   責務：盤面状態をビットマスクで表現し、他モジュールが共有する純粋関数を提供する。
+============================================================================ */
+
+const ALL = 0b111111111;
+const bitcount = (x) => { let c = 0; while (x) { c += x & 1; x >>= 1; } return c; };
+const lowbitIndex = (x) => { let i = 0; while (!(x & 1)) { x >>= 1; i++; } return i; };
+const rc = (pos) => `(${Math.floor(pos / 9) + 1},${(pos % 9) + 1})`;
+
+function buildUnits() {
+  const units = [];
+  for (let r = 0; r < 9; r++) units.push(Array.from({ length: 9 }, (_, c) => r * 9 + c));
+  for (let c = 0; c < 9; c++) units.push(Array.from({ length: 9 }, (_, r) => r * 9 + c));
+  for (let br = 0; br < 3; br++) for (let bc = 0; bc < 3; bc++) {
+    const u = [];
+    for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) u.push((br * 3 + r) * 9 + (bc * 3 + c));
+    units.push(u);
+  }
+  return units;
+}
+const UNITS = buildUnits();
+const ROW_UNITS = UNITS.slice(0, 9); // 6.5 行優先初期処理で使用
+
+function buildPeers() {
+  const peers = [];
+  for (let pos = 0; pos < 81; pos++) {
+    const s = new Set();
+    for (const u of UNITS) if (u.includes(pos)) for (const p of u) if (p !== pos) s.add(p);
+    peers.push([...s]);
+  }
+  return peers;
+}
+const PEERS = buildPeers();
+const peersOf = (pos) => PEERS[pos];
+
+function parsePuzzle(s) {
+  const clean = s.replace(/[_.]/g, "0");
+  return clean.split("").map((ch) => parseInt(ch, 10) || 0);
+}
+
+// 検証済み例題（一意解・重複givenなしを事前確認済み）
+const SAMPLES = {
+  かんたん: "796345000081600900300008700058000300003201000002007068000754810007020409010893027",
+  ふつう: "005900120021600803000023009407060350650410008000030000780200000030080090000000200",
+  むずかしい: "000470010700000406003200000000050201600802000070000050008000030030065000961080000",
+};
+
+/* ============================================================================
+   M2｜手筋（制約伝播）モジュール
+   責務：確定的に導ける手筋を優先度順に1つずつ適用する。
+============================================================================ */
+
+function eliminate(cells, pos, depth, ctx, technique) {
+  const val = lowbitIndex(cells[pos]) + 1;
+  const bit = 1 << (val - 1);
+  const affected = [];
+  for (const p of peersOf(pos)) {
+    if (cells[p] & bit) {
+      cells[p] &= ~bit;
+      affected.push(p);
+      if (cells[p] === 0) {
+        ctx.snapshot(cells, {
+          kind: "fail", depth, technique,
+          text: `${rc(p)} の候補が0になり矛盾が発生しました（${rc(pos)}=${val} の確定による）。`,
+          failPos: p,
+        });
+        return "fail";
+      }
+    }
+  }
+  if (affected.length) {
+    ctx.snapshot(cells, {
+      kind: "eliminate", depth, technique,
+      text: `${rc(pos)}=${val} が確定したため、周囲 ${affected.length} マスの候補から ${val} を除去しました。`,
+      sourcePos: pos, elimPositions: affected,
+    });
+    return "changed";
+  }
+  return "none";
+}
+
+function nakedSingle(cells, depth, ctx, opts = {}) {
+  const label = opts.techniqueLabel || "裸シングル";
+  let anyChange = false;
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (let pos = 0; pos < 81; pos++) {
+      if (bitcount(cells[pos]) === 1) {
+        const r = eliminate(cells, pos, depth, ctx, label);
+        if (r === "fail") return "fail";
+        if (r === "changed") { anyChange = true; progress = true; }
+      }
+    }
+  }
+  return anyChange ? "changed" : "none";
+}
+
+function hiddenSingle(cells, depth, ctx, opts = {}) {
+  const scope = opts.unitScope || UNITS;
+  const label = opts.techniqueLabel || "隠れシングル";
+  let anyChange = false;
+  for (const unit of scope) {
+    for (let d = 1; d <= 9; d++) {
+      const bit = 1 << (d - 1);
+      let count = 0, foundPos = -1;
+      for (const pos of unit) if (cells[pos] & bit) { count++; foundPos = pos; }
+      if (count === 1 && bitcount(cells[foundPos]) > 1) {
+        cells[foundPos] = bit;
+        ctx.snapshot(cells, {
+          kind: "eliminate", depth, technique: label,
+          text: `${rc(foundPos)} はこのユニット内で ${d} を置ける唯一のマスのため確定しました。`,
+          sourcePos: foundPos,
+        });
+        const r = eliminate(cells, foundPos, depth, ctx, label);
+        if (r === "fail") return "fail";
+        anyChange = true;
+      }
+    }
+  }
+  return anyChange ? "changed" : "none";
+}
+
+function nakedPair(cells, depth, ctx) {
+  let anyChange = false;
+  for (const unit of UNITS) {
+    const twoCandCells = unit.filter((pos) => bitcount(cells[pos]) === 2);
+    for (let i = 0; i < twoCandCells.length; i++) {
+      for (let j = i + 1; j < twoCandCells.length; j++) {
+        const a = twoCandCells[i], b = twoCandCells[j];
+        if (cells[a] === cells[b]) {
+          const mask = cells[a];
+          let changedHere = false;
+          const affected = [];
+          for (const pos of unit) {
+            if (pos === a || pos === b) continue;
+            if (cells[pos] & mask) {
+              cells[pos] &= ~mask;
+              changedHere = true;
+              affected.push(pos);
+              if (cells[pos] === 0) {
+                ctx.snapshot(cells, {
+                  kind: "fail", depth, technique: "ネイキッドペア",
+                  text: `${rc(pos)} の候補が0になり矛盾が発生しました。`, failPos: pos,
+                });
+                return "fail";
+              }
+            }
+          }
+          if (changedHere) {
+            anyChange = true;
+            ctx.snapshot(cells, {
+              kind: "eliminate", depth, technique: "ネイキッドペア",
+              text: `${rc(a)}と${rc(b)}のネイキッドペアにより、同一ユニット内の他マスから候補を除去しました。`,
+              sourcePos: a, elimPositions: affected,
+            });
+          }
+        }
+      }
+    }
+  }
+  return anyChange ? "changed" : "none";
+}
+
+// 6.1｜手筋レジストリ（技法プラガブル化）
+// 各手筋は共通シグネチャ (cells, depth, ctx) => "changed" | "none" | "fail" を持つ。
+// 新しい手筋（X-Wing等）は、この配列へ1エントリ追加するだけで propagate に組み込まれる。
+const TECHNIQUES = [
+  { id: "nakedSingle", label: "裸シングル", priority: 1, enabled: true, run: nakedSingle },
+  { id: "hiddenSingle", label: "隠れシングル", priority: 2, enabled: true, run: hiddenSingle },
+  { id: "nakedPair", label: "ネイキッドペア", priority: 3, enabled: true, run: nakedPair },
+];
+
+function propagate(cells, depth, ctx) {
+  let progress = true;
+  while (progress) {
+    progress = false;
+    const active = TECHNIQUES.filter((t) => t.enabled).sort((a, b) => a.priority - b.priority);
+    for (const t of active) {
+      const r = t.run(cells, depth, ctx);
+      if (r === "fail") return false;
+      if (r === "changed") { progress = true; break; }
+    }
+  }
+  return true;
+}
+
+/* ----------------------------------------------------------------------------
+   6.5｜行優先初期処理（提案機能・実装）
+   仮定探索に入る前（depth===0の最初の呼び出しのみ）に、行ユニットだけで解ける
+   基礎的なマスを先に確定させ、以降の分岐候補数を減らす。
+---------------------------------------------------------------------------- */
+function rowFirstPrepass(cells, depth, ctx) {
+  while (true) {
+    let r = nakedSingle(cells, depth, ctx, { techniqueLabel: "行優先初期処理" });
+    if (r === "fail") return false;
+    if (r === "changed") continue;
+    r = hiddenSingle(cells, depth, ctx, { unitScope: ROW_UNITS, techniqueLabel: "行優先初期処理" });
+    if (r === "fail") return false;
+    if (r === "changed") continue;
+    break;
+  }
+  return true;
+}
+
+/* ============================================================================
+   M3｜仮定探索／バックトラッキングモジュール
+============================================================================ */
+
+function selectMRV(cells) {
+  let best = -1, bestCount = 10;
+  for (let pos = 0; pos < 81; pos++) {
+    const c = bitcount(cells[pos]);
+    if (c >= 2 && c < bestCount) { bestCount = c; best = pos; }
+  }
+  return best;
+}
+
+function search(cellsIn, depth, ctx) {
+  const cells = cellsIn.slice();
+
+  if (depth === 0) {
+    if (!rowFirstPrepass(cells, depth, ctx)) {
+      ctx.creditNearestCheckpoint(ctx.steps.length - 1);
+      return false;
+    }
+  }
+
+  if (!propagate(cells, depth, ctx)) {
+    ctx.creditNearestCheckpoint(ctx.steps.length - 1);
+    return false;
+  }
+
+  const allDone = cells.every((c) => bitcount(c) === 1);
+  if (allDone) {
+    ctx.snapshot(cells, { kind: "solved", depth, technique: "完了", text: "すべてのマスが確定し、解が見つかりました。" });
+    return true;
+  }
+
+  const pos = selectMRV(cells);
+  if (pos === -1) {
+    ctx.creditNearestCheckpoint(ctx.steps.length - 1);
+    return false;
+  }
+  const mask = cells[pos];
+  ctx.addCheckpoint(ctx.steps.length, `${rc(pos)} の仮定探索`, "branch");
+
+  for (let d = 1; d <= 9; d++) {
+    if (mask & (1 << (d - 1))) {
+      const branch = cells.slice();
+      branch[pos] = 1 << (d - 1);
+      ctx.snapshot(branch, {
+        kind: "guess", depth: depth + 1, technique: "MRV仮定探索",
+        text: `${rc(pos)} を候補 ${d} と仮定して探索します（候補数最小マス, 全${bitcount(mask)}候補中）。`,
+        guessPos: pos,
+      });
+      if (search(branch, depth + 1, ctx)) return true;
+    }
+  }
+  return false;
+}
+
+/* ============================================================================
+   M4｜チェックポイント管理モジュール
+============================================================================ */
+
+const CP_INTERVAL = 25;
+
+function makeCheckpointManager() {
+  const checkpoints = [];
+  let seq = 0;
+  function addCheckpoint(step, label, type) {
+    const cp = { step, label, type, seq: seq++, hits: 0 };
+    checkpoints.push(cp);
+    return cp;
+  }
+  function creditNearestCheckpoint(failStep) {
+    let nearest = null;
+    for (const cp of checkpoints) if (cp.step <= failStep && (!nearest || cp.step > nearest.step)) nearest = cp;
+    if (nearest) nearest.hits += 1;
+  }
+  return { checkpoints, addCheckpoint, creditNearestCheckpoint };
+}
+
+/* ============================================================================
+   M5｜ソルバー実行制御モジュール
+============================================================================ */
+
+function runSolve(given) {
+  const steps = [];
+  const cpManager = makeCheckpointManager();
+  let passCount = 0;
+
+  const ctx = {
+    steps,
+    checkpoints: cpManager.checkpoints,
+    addCheckpoint: cpManager.addCheckpoint,
+    creditNearestCheckpoint: cpManager.creditNearestCheckpoint,
+    snapshot(cells, info) {
+      passCount++;
+      steps.push({ ...info, pass: passCount, cells: cells.slice() });
+      if (steps.length % CP_INTERVAL === 0) {
+        cpManager.addCheckpoint(steps.length - 1, `${steps.length}手目`, "interval");
+      }
+    },
+  };
+
+  const initCells = given.map((v) => (v === 0 ? ALL : 1 << (v - 1)));
+  steps.push({ kind: "init", depth: 0, technique: "初期化", text: "初期盤面を読み込みました。", pass: 0, cells: initCells.slice() });
+
+  const ok = search(initCells, 0, ctx);
+  const error = ok ? null : "解が見つかりませんでした。この盤面には解が存在しないか、入力に誤りがある可能性があります。";
+
+  return { frames: steps, cps: cpManager.checkpoints, error };
+}
+
+/* ============================================================================
+   M9｜候補表示（作成支援）モジュール ／ 3.9.1｜色分け表示と自動確定（新規実装）
+   責務：編集モード中、空欄マスに置ける数字（重複しない数字）だけをガイド表示する。
+   ソルバー本体の制約伝播とは独立した、単純な重複チェックのみで動作する。
+============================================================================ */
+
+function usableDigits(given, pos) {
+  if (given[pos] !== 0) return [];
+  const row = Math.floor(pos / 9), col = pos % 9;
+  const used = new Set();
+  for (let c = 0; c < 9; c++) { const v = given[row * 9 + c]; if (v) used.add(v); }
+  for (let r = 0; r < 9; r++) { const v = given[r * 9 + col]; if (v) used.add(v); }
+  const br = 3 * Math.floor(row / 3), bc = 3 * Math.floor(col / 3);
+  for (let r = br; r < br + 3; r++) for (let c = bc; c < bc + 3; c++) { const v = given[r * 9 + c]; if (v) used.add(v); }
+  const out = [];
+  for (let d = 1; d <= 9; d++) if (!used.has(d)) out.push(d);
+  return out;
+}
+
+// 追加機能①：編集中の重複入力検知（同一行・列・3×3ブロック内に同じ数字が既にあるか）
+function hasConflict(given, pos) {
+  const v = given[pos];
+  if (v === 0) return false;
+  const row = Math.floor(pos / 9), col = pos % 9;
+  for (let c = 0; c < 9; c++) { if (c !== col && given[row * 9 + c] === v) return true; }
+  for (let r = 0; r < 9; r++) { if (r !== row && given[r * 9 + col] === v) return true; }
+  const br = 3 * Math.floor(row / 3), bc = 3 * Math.floor(col / 3);
+  for (let r = br; r < br + 3; r++) for (let c = bc; c < bc + 3; c++) { if ((r * 9 + c) !== pos && given[r * 9 + c] === v) return true; }
+  return false;
+}
+
+/* ============================================================================
+   M13｜スタイル／デザイントークンモジュール
+============================================================================ */
+
+const CSS = `
+:root{
+  --bg:#0e1420; --panel:#161d2c; --panel2:#121927; --ink:#f1ead9; --muted:#8b93a8;
+  --line:#2a3348; --accent:#c9a15c; --guess:#8a5a3d; --elim:#28344c; --solved:#7fa87a;
+  --fail:#b8555a; --cand2:#5b9bd5; --cand3:#d4b23c;
+}
+*{box-sizing:border-box;}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Zen Kaku Gothic New","Hiragino Kaku Gothic ProN","Hiragino Sans",-apple-system,BlinkMacSystemFont,sans-serif;}
+button{font-family:inherit;cursor:pointer;}
+button:disabled{cursor:not-allowed;opacity:0.45;}
+input{font-family:inherit;}
+::-webkit-scrollbar{width:8px;height:8px;}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:4px;}
+.sv-edit-input{caret-color:var(--ink);}
+.sv-edit-input::placeholder{color:var(--ph-color,var(--muted));opacity:1;letter-spacing:1px;font-weight:600;font-size:13px;}
+input[type=range].sv-speed{-webkit-appearance:none;appearance:none;height:6px;border-radius:3px;background:var(--line);outline:none;}
+input[type=range].sv-speed::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid var(--bg);}
+input[type=range].sv-speed::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--accent);cursor:pointer;border:2px solid var(--bg);}
+`;
+
+const S = {
+  app: { minHeight: "100vh", background: "var(--bg)", color: "var(--ink)", padding: "20px 20px 96px", display: "flex", flexDirection: "column", gap: 14, maxWidth: 1180, margin: "0 auto" },
+  header: { display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap" },
+  title: { fontSize: 22, fontWeight: 800, margin: 0, letterSpacing: 1 },
+  subtitle: { fontSize: 12.5, color: "var(--muted)", margin: 0 },
+
+  controlsBar: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 12, padding: "10px 14px" },
+  chipsRow: { display: "flex", gap: 6 },
+  chip: (active) => ({ padding: "6px 12px", borderRadius: 999, border: `1px solid ${active ? "var(--accent)" : "var(--line)"}`, background: active ? "rgba(201,161,92,0.16)" : "transparent", color: active ? "var(--accent)" : "var(--muted)", fontSize: 13, fontWeight: 700 }),
+  btn: (variant) => {
+    const base = { padding: "7px 14px", borderRadius: 9, border: "1px solid var(--line)", background: "var(--panel2)", color: "var(--ink)", fontSize: 13, fontWeight: 700, display: "inline-flex", alignItems: "center", gap: 6 };
+    if (variant === "primary") return { ...base, background: "var(--accent)", color: "#20180a", border: "1px solid var(--accent)" };
+    if (variant === "ghost") return { ...base, background: "transparent" };
+    return base;
+  },
+  speedWrap: { display: "flex", alignItems: "center", gap: 8, marginLeft: "auto", minWidth: 180 },
+  speedLabel: { fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" },
+
+  errorBox: { background: "rgba(184,85,90,0.14)", border: "1px solid var(--fail)", color: "var(--fail)", borderRadius: 10, padding: "10px 14px", fontSize: 13.5, fontWeight: 600 },
+
+  mainArea: { display: "flex", gap: 16, alignItems: "flex-start", flexWrap: "wrap" },
+  boardCol: { display: "flex", flexDirection: "column", gap: 10, flex: "0 0 auto" },
+  statusBar: { fontSize: 12.5, color: "var(--muted)", display: "flex", justifyContent: "space-between", padding: "0 2px" },
+
+  board: { display: "grid", gridTemplateColumns: "repeat(9, 54px)", gridTemplateRows: "repeat(9, 54px)", background: "var(--panel2)", border: "2px solid var(--ink)", borderRadius: 4, overflow: "hidden" },
+  cell: { display: "flex", alignItems: "center", justifyContent: "center", position: "relative", background: "transparent" },
+  cellDigit: (given, highlighted) => ({ fontSize: 24, fontWeight: given ? 800 : 600, color: highlighted ? "var(--solved)" : "var(--ink)" }),
+  cands: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: "repeat(3, 1fr)", width: "100%", height: "100%", padding: 3 },
+  candDigit: { fontSize: 10.5, color: "var(--muted)", display: "flex", alignItems: "center", justifyContent: "center" },
+  cellInput: { width: "100%", height: "100%", background: "transparent", border: "none", outline: "none", textAlign: "center", fontSize: 22, fontWeight: 700, color: "var(--ink)", position: "relative", zIndex: 2 },
+  candOverlay: { position: "absolute", inset: 0, display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gridTemplateRows: "repeat(3, 1fr)", padding: 3, pointerEvents: "none", zIndex: 1 },
+  candOverlayDigit: { fontSize: 10.5, display: "flex", alignItems: "center", justifyContent: "center" },
+
+  panel: { flex: "1 1 320px", minWidth: 300, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", gap: 14 },
+  stepHead: { fontSize: 13, color: "var(--muted)" },
+  badge: (kind) => {
+    const colors = { init: "var(--muted)", eliminate: "var(--elim)", guess: "var(--guess)", fail: "var(--fail)", solved: "var(--solved)" };
+    const c = colors[kind] || "var(--muted)";
+    return { display: "inline-block", padding: "3px 10px", borderRadius: 999, background: "rgba(255,255,255,0.06)", border: `1px solid ${c}`, color: c, fontSize: 12, fontWeight: 800 };
+  },
+  logText: { fontSize: 14.5, lineHeight: 1.7, color: "var(--ink)" },
+  metaRow: { display: "flex", gap: 16, fontSize: 12.5, color: "var(--muted)" },
+  legend: { display: "flex", flexDirection: "column", gap: 6, fontSize: 12.5 },
+  legendRow: { display: "flex", alignItems: "center", gap: 8 },
+  legendSwatch: (color) => ({ width: 14, height: 14, borderRadius: 4, background: color, flexShrink: 0 }),
+
+  cpBox: { display: "flex", flexDirection: "column", gap: 8 },
+  cpHead: { fontSize: 12.5, color: "var(--muted)", display: "flex", justifyContent: "space-between" },
+  cpList: { display: "flex", flexDirection: "column", gap: 4, maxHeight: 220, overflowY: "auto" },
+  cpItem: (type, reached, isCurrent) => ({
+    display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
+    padding: "6px 10px", borderRadius: 7,
+    borderLeft: `3px solid ${type === "branch" ? "var(--accent)" : "#5b9bd5"}`,
+    background: isCurrent ? "rgba(201,161,92,0.14)" : "rgba(255,255,255,0.03)",
+    opacity: reached ? 1 : 0.42, fontSize: 12.5, cursor: "pointer", border0: 0,
+  }),
+  hitsBadge: { background: "rgba(127,168,122,0.18)", color: "var(--solved)", borderRadius: 999, padding: "1px 8px", fontSize: 11, fontWeight: 800 },
+
+  editBar: { position: "fixed", left: 0, right: 0, bottom: 0, background: "var(--panel)", borderTop: "1px solid var(--line)", padding: "10px 20px", display: "flex", justifyContent: "center", gap: 10, zIndex: 20 },
+};
+
+/* ============================================================================
+   M7｜盤面表示ヘルパー ／ M10｜情報パネル用ラベル
+============================================================================ */
+
+function cellDisplay(mask) {
+  const count = bitcount(mask);
+  if (count === 0) return { type: "contradiction" };
+  if (count === 1) return { type: "digit", value: lowbitIndex(mask) + 1 };
+  const values = [];
+  for (let d = 1; d <= 9; d++) if (mask & (1 << (d - 1))) values.push(d);
+  return { type: "candidates", values };
+}
+
+function kindLabel(kind) {
+  switch (kind) {
+    case "init": return "初期化";
+    case "eliminate": return "候補排除";
+    case "guess": return "仮定";
+    case "fail": return "矛盾";
+    case "solved": return "完了";
+    default: return kind;
+  }
+}
+
+/* ============================================================================
+   M14｜アプリ状態管理・ルートコンポーネント
+============================================================================ */
+
+function SudokuVisualizer() {
+  // --- state ---
+  const [sampleKey, setSampleKey] = useState("ふつう");
+  const [given, setGiven] = useState(() => parsePuzzle(SAMPLES["ふつう"]));
+  const [frames, setFrames] = useState([]);
+  const [cps, setCps] = useState([]);
+  const [idx, setIdx] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [speed, setSpeed] = useState(500);
+  const [solving, setSolving] = useState(false);
+  const [error, setError] = useState(null);
+  const [editing, setEditing] = useState(false);
+  const [showCandidates, setShowCandidates] = useState(false);
+  const [candMode, setCandMode] = useState("list"); // "list"=列記（placeholder） / "grid"=配置（3x3ミニグリッド）
+  const [autoFilledSet, setAutoFilledSet] = useState(() => new Set());
+  const timerRef = useRef(null);
+
+  // --- M12: 例題選択 ---
+  const loadSample = useCallback((k) => {
+    setSampleKey(k);
+    setGiven(parsePuzzle(SAMPLES[k]));
+    setFrames([]); setCps([]); setIdx(0); setPlaying(false); setError(null);
+    setEditing(false); setShowCandidates(false); setAutoFilledSet(new Set());
+  }, []);
+
+  // --- M5: 求解 ---
+  const solve = useCallback(() => {
+    setSolving(true); setError(null); setEditing(false); setPlaying(false);
+    setTimeout(() => {
+      try {
+        const { frames: fs, cps: cs, error: err } = runSolve(given);
+        setFrames(fs); setCps(cs); setIdx(0); setError(err); setSolving(false);
+        if (!err) setPlaying(true);
+      } catch (e) {
+        setError("求解中にエラーが発生しました: " + (e && e.message ? e.message : String(e)));
+        setSolving(false);
+      }
+    }, 20);
+  }, [given]);
+
+  // --- M6: 再生制御 ---
+  useEffect(() => {
+    if (!playing) return undefined;
+    if (idx >= frames.length - 1) { setPlaying(false); return undefined; }
+    timerRef.current = setTimeout(() => setIdx((i) => Math.min(i + 1, frames.length - 1)), speed);
+    return () => clearTimeout(timerRef.current);
+  }, [playing, idx, frames.length, speed]);
+
+  const jumpToCp = useCallback((step) => { setPlaying(false); setIdx(step); }, []);
+  const prevCp = useCallback(() => {
+    const before = cps.filter((c) => c.step < idx).sort((a, b) => b.step - a.step);
+    if (before.length) jumpToCp(before[0].step);
+  }, [cps, idx, jumpToCp]);
+  const nextCp = useCallback(() => {
+    const after = cps.filter((c) => c.step > idx).sort((a, b) => a.step - b.step);
+    if (after.length) jumpToCp(after[0].step);
+  }, [cps, idx, jumpToCp]);
+  const stepPrev = useCallback(() => { setPlaying(false); setIdx((i) => Math.max(0, i - 1)); }, []);
+  const stepNext = useCallback(() => { setPlaying(false); setIdx((i) => Math.min(frames.length - 1, i + 1)); }, [frames.length]);
+
+  // --- M8: 問題編集モード ---
+  const startEdit = useCallback(() => {
+    setEditing(true); setFrames([]); setCps([]); setIdx(0); setError(null); setPlaying(false);
+  }, []);
+  const endEdit = useCallback(() => { setEditing(false); setShowCandidates(false); }, []);
+  const resetChart = useCallback(() => { setGiven(Array(81).fill(0)); setAutoFilledSet(new Set()); }, []);
+  const onEditCell = useCallback((pos, raw) => {
+    const ch = (raw || "").slice(-1);
+    const digit = /^[1-9]$/.test(ch) ? parseInt(ch, 10) : 0;
+    setGiven((prev) => { const next = prev.slice(); next[pos] = digit; return next; });
+    setAutoFilledSet((prev) => { if (!prev.has(pos)) return prev; const s = new Set(prev); s.delete(pos); return s; });
+  }, []);
+
+  // --- 3.9.1: 候補数1マスの連鎖的自動確定（showCandidates ON の間だけ動作） ---
+  useEffect(() => {
+    if (!editing || !showCandidates) return undefined;
+    for (let pos = 0; pos < 81; pos++) {
+      if (given[pos] === 0) {
+        const opts = usableDigits(given, pos);
+        if (opts.length === 1) {
+          const next = given.slice();
+          next[pos] = opts[0];
+          setGiven(next);
+          setAutoFilledSet((prev) => { const s = new Set(prev); s.add(pos); return s; });
+          return undefined;
+        }
+      }
+    }
+    return undefined;
+  }, [given, editing, showCandidates]);
+
+  // --- 派生値 ---
+  const cur = frames.length ? frames[idx] : null;
+  const curCells = cur ? cur.cells : given.map((v) => (v === 0 ? ALL : 1 << (v - 1)));
+  const confirmedCount = curCells.filter((c) => bitcount(c) === 1).length;
+  const blockLineHighlight = editing && showCandidates;
+
+  return (
+    <div style={S.app}>
+      <style>{CSS}</style>
+
+      {/* ヘッダー */}
+      <div style={S.header}>
+        <h1 style={S.title}>ナンプレ自動回答観察アプリ</h1>
+        <p style={S.subtitle}>制約伝播とバックトラッキングの過程を1手ずつ可視化します</p>
+      </div>
+
+      {/* M12: コントロールバー */}
+      <div style={S.controlsBar}>
+        <div style={S.chipsRow}>
+          {Object.keys(SAMPLES).map((k) => (
+            <button key={k} style={S.chip(sampleKey === k && !editing)} onClick={() => loadSample(k)} disabled={solving}>
+              {k}
+            </button>
+          ))}
+        </div>
+        <button style={S.btn("primary")} onClick={solve} disabled={solving || editing}>
+          {solving ? "求解中…" : "求解する"}
+        </button>
+        <button style={S.btn()} onClick={() => setPlaying((p) => !p)} disabled={!frames.length || idx >= frames.length - 1 && !playing}>
+          {playing ? "一時停止" : "再生"}
+        </button>
+        <button style={S.btn("ghost")} onClick={stepPrev} disabled={!frames.length || idx === 0}>◀ 1手</button>
+        <button style={S.btn("ghost")} onClick={stepNext} disabled={!frames.length || idx >= frames.length - 1}>1手 ▶</button>
+        <button style={S.btn("ghost")} onClick={prevCp} disabled={!cps.length}>◀ 折返</button>
+        <button style={S.btn("ghost")} onClick={nextCp} disabled={!cps.length}>折返 ▶</button>
+        <div style={S.speedWrap}>
+          <span style={S.speedLabel}>速度 {(speed / 1000).toFixed(1)}秒/手</span>
+          <input
+            className="sv-speed" type="range" min={100} max={1000} step={50}
+            value={speed} onChange={(e) => setSpeed(parseInt(e.target.value, 10))}
+            style={{ flex: 1 }}
+          />
+        </div>
+      </div>
+
+      {error && <div style={S.errorBox}>{error}</div>}
+
+      {/* メインエリア */}
+      <div style={S.mainArea}>
+        {/* M7: 盤面 */}
+        <div style={S.boardCol}>
+          <div style={S.statusBar}>
+            <span>{editing ? "編集モード" : cur ? `技法: ${cur.technique}` : "求解前"}</span>
+            <span>{frames.length ? `${idx + 1} / ${frames.length}` : "－ / －"}</span>
+          </div>
+          <div style={S.board}>
+            {Array.from({ length: 81 }, (_, pos) => {
+              const row = Math.floor(pos / 9), col = pos % 9;
+              const rightThick = col % 3 === 2 && col !== 8;
+              const bottomThick = row % 3 === 2 && row !== 8;
+              const lineColor = blockLineHighlight ? "var(--ink)" : "var(--line)";
+              const borderStyle = {
+                borderRight: rightThick ? `2px solid ${lineColor}` : "1px solid var(--line)",
+                borderBottom: bottomThick ? `2px solid ${lineColor}` : "1px solid var(--line)",
+              };
+
+              if (editing) {
+                const v = given[pos];
+                const isAuto = autoFilledSet.has(pos);
+                const conflict = hasConflict(given, pos);
+
+                // 空欄マスの候補ガイド：列記（placeholder文字列）／配置（3×3ミニグリッド）
+                let placeholder = "", phColor = "var(--muted)";
+                let gridOverlay = null;
+                if (v === 0 && showCandidates) {
+                  const opts = usableDigits(given, pos);
+                  const colorForCount = opts.length === 0 ? "var(--fail)" : opts.length === 2 ? "var(--cand2)" : opts.length === 3 ? "var(--cand3)" : "var(--muted)";
+                  if (candMode === "list") {
+                    placeholder = opts.length === 0 ? "×" : opts.join("");
+                    phColor = colorForCount;
+                  } else {
+                    // 配置モード：解答画面と同じ3×3ミニグリッドで表示
+                    gridOverlay = (
+                      <div style={S.candOverlay}>
+                        {opts.length === 0 ? (
+                          <span style={{ ...S.candOverlayDigit, gridColumn: "1 / span 3", gridRow: "1 / span 3", color: "var(--fail)", fontSize: 18, fontWeight: 800 }}>×</span>
+                        ) : (
+                          Array.from({ length: 9 }, (_, i) => i + 1).map((d) => (
+                            <span key={d} style={{ ...S.candOverlayDigit, color: colorForCount, visibility: opts.includes(d) ? "visible" : "hidden" }}>{d}</span>
+                          ))
+                        )}
+                      </div>
+                    );
+                  }
+                }
+
+                const inputColor = conflict ? "var(--fail)" : isAuto ? "var(--solved)" : "var(--ink)";
+                return (
+                  <div key={pos} style={{ ...S.cell, ...borderStyle }}>
+                    {gridOverlay}
+                    <input
+                      className="sv-edit-input"
+                      style={{ ...S.cellInput, "--ph-color": phColor, fontStyle: isAuto ? "italic" : "normal", color: inputColor }}
+                      value={v === 0 ? "" : String(v)}
+                      placeholder={placeholder}
+                      title={conflict ? "同じ行・列・ブロック内に重複する数字があります" : isAuto ? "候補が1つに絞られたため自動確定されました" : undefined}
+                      onChange={(e) => onEditCell(pos, e.target.value)}
+                    />
+                  </div>
+                );
+              }
+
+              const mask = curCells[pos];
+              const disp = cellDisplay(mask);
+              const isGivenCell = given[pos] !== 0;
+              const isGuess = cur && cur.kind === "guess" && cur.guessPos === pos;
+              const isSource = cur && cur.kind === "eliminate" && cur.sourcePos === pos;
+              const isElimTarget = cur && cur.kind === "eliminate" && cur.elimPositions && cur.elimPositions.includes(pos);
+              const isFailPos = cur && cur.kind === "fail" && cur.failPos === pos;
+
+              let bg = "transparent";
+              if (isGuess) bg = "var(--guess)";
+              else if (isFailPos) bg = "var(--fail)";
+              else if (isElimTarget) bg = "var(--elim)";
+
+              return (
+                <div key={pos} style={{ ...S.cell, ...borderStyle, background: bg }}>
+                  {disp.type === "digit" && (
+                    <span style={S.cellDigit(isGivenCell, isSource)}>{disp.value}</span>
+                  )}
+                  {disp.type === "contradiction" && <span style={{ color: "var(--fail)", fontSize: 20, fontWeight: 800 }}>×</span>}
+                  {disp.type === "candidates" && (
+                    <div style={S.cands}>
+                      {Array.from({ length: 9 }, (_, i) => i + 1).map((d) => (
+                        <span key={d} style={{ ...S.candDigit, visibility: disp.values.includes(d) ? "visible" : "hidden" }}>{d}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* M10 / M11: 情報パネル */}
+        <div style={S.panel}>
+          {editing ? (
+            <>
+              <div style={S.stepHead}>編集モード</div>
+              <div style={S.logText}>
+                マスをクリックして数字（1〜9）を直接入力してください。0 または範囲外の入力は空欄として扱われます。
+                同じ行・列・3×3ブロック内に数字が重複した場合、その数字は赤字で表示されます。
+                {showCandidates && ` 候補表示がONの間は、置ける数字が1つに絞られたマスへ自動で数字が入力されます（斜体表示のマスが自動確定分です）。候補ガイドの表示形式は「${candMode === "list" ? "列記" : "配置"}」ボタンで切り替えられます。`}
+              </div>
+            </>
+          ) : cur ? (
+            <>
+              <div style={S.stepHead}>ステップ {idx + 1} / {frames.length}</div>
+              <span style={S.badge(cur.kind)}>{kindLabel(cur.kind)}</span>
+              <div style={S.logText}>{cur.text}</div>
+              <div style={S.metaRow}>
+                <span>巡回: {cur.pass}</span>
+                <span>探索の深さ: {cur.depth}</span>
+                <span>確定マス: {confirmedCount} / 81</span>
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={S.stepHead}>－ / －</div>
+              <div style={S.logText}>「求解する」を押すと、制約伝播とバックトラッキングの過程が1手ずつ再生されます。</div>
+            </>
+          )}
+
+          <div style={S.legend}>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--guess)")} />仮定したマス</div>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--elim)")} />候補を排除中</div>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--solved)")} />解で埋めた数字</div>
+            <div style={S.legendRow}><span style={S.legendSwatch("var(--fail)")} />矛盾（候補が0に）</div>
+          </div>
+
+          {!!cps.length && (
+            <div style={S.cpBox}>
+              <div style={S.cpHead}>
+                <span>折り返しポイント: {cps.length}件</span>
+                <span>有効回数合計: {cps.reduce((a, c) => a + c.hits, 0)}</span>
+              </div>
+              <div style={S.cpList}>
+                {cps.map((cp) => (
+                  <div key={cp.seq} style={S.cpItem(cp.type, cp.step <= idx, cp.step === idx)} onClick={() => jumpToCp(cp.step)}>
+                    <span>#{cp.seq + 1} ・ {cp.step + 1}手目 ・ {cp.label}</span>
+                    {cp.hits > 0 && <span style={S.hitsBadge}>×{cp.hits}</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* M8: 編集フッター */}
+      <div style={S.editBar}>
+        {editing && (
+          <>
+            <button style={S.btn("ghost")} onClick={resetChart}>チャートの初期化</button>
+            <button style={S.btn("ghost")} onClick={() => setCandMode((m) => (m === "list" ? "grid" : "list"))}>
+              {candMode === "list" ? "列記" : "配置"}
+            </button>
+            <button style={S.btn(showCandidates ? "primary" : undefined)} onClick={() => setShowCandidates((s) => !s)}>
+              候補表示{showCandidates ? " ON" : " OFF"}
+            </button>
+          </>
+        )}
+        <button style={S.btn(editing ? "primary" : undefined)} onClick={editing ? endEdit : startEdit}>
+          {editing ? "編集終了" : "編集"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+const rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(React.createElement(SudokuVisualizer));
+</script>
+<script>
+  // Babelのバージョンによらず classic runtime（React.createElement方式）を明示的に指定し、
+  // "react/jsx-runtime" の解決不能によるエラーを避ける。
+  var srcCode = document.getElementById('app-source').textContent;
+  var result = Babel.transform(srcCode, {
+    presets: [['react', { runtime: 'classic' }]]
+  });
+  var s = document.createElement('script');
+  s.textContent = result.code;
+  document.body.appendChild(s);
+</script>
+</body>
+</html>
